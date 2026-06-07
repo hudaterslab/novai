@@ -1,0 +1,16 @@
+cd ~/Desktop/hai
+source venv-dx-runtime/bin/activate
+python3 multi_event.py | tee run.log
+
+curl -L https://huggingface.co -o hanjin_cctv.dxnn
+
+# 1. 백그라운드 서비스 중지
+sudo systemctl stop cctv_ai.service
+
+# 2. 수동 실행 및 설정 진행 (GUI 플래그 등을 활용)
+python3 multi_event.py --gui
+
+# 3. 설정 완료(cameras.json 업데이트) 후 프로그램 종료
+
+# 4. 백그라운드 서비스 재시작
+sudo systemctl start cctv_ai.service
