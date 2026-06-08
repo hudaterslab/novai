@@ -80,38 +80,46 @@ MIN_APPLY_PERSPECTIVE = 0.0005
 KEEP_LAST_GOOD_ROI_ON_FAILURE = True
 DEBUG_ALIGN = True
 
-# [핵심] 단일 통합 모델의 결과를 클래스별로 분할하는 래퍼 함수 (Numpy Vectorization 최적화)
+# [핵심] NPU 추론뿐만 아니라 무거운 트래커 연산과 OpenCV 렌더링까지 스레드 단에서 병렬로 처리합니다.
 def process_camera_task(idx, cam, fr, fid, connected, main_conf, person_conf, helmet_conf):
     if not connected or fr is None:
-        return idx, fr, fid, np.empty((0,6)), np.empty((0,6)), np.empty((0,6)), False
+        return idx, fid, fr, None, [], False
                 
     base_conf = min(main_conf, person_conf, helmet_conf)
     raw_dets = cam.det_main.infer(fr, conf_override=base_conf)
     
     if len(raw_dets) == 0:
-        return idx, fr, fid, np.empty((0,6)), np.empty((0,6)), np.empty((0,6)), True
+        d_main_res = np.empty((0,6))
+        d_helmet_res = np.empty((0,6))
+        d_signal_res = np.empty((0,6))
+    else:
+        scores = raw_dets[:, 4]
+        classes = raw_dets[:, 5].astype(int)
         
-    scores = raw_dets[:, 4]
-    classes = raw_dets[:, 5].astype(int)
+        m_signal = ((classes == ID_REFLECTIVE_VEST) | (classes == ID_X_BAND)) & (scores >= person_conf)
+        m_helmet = ((classes == ID_H_HELMET) | (classes == ID_H_NO_HELMET)) & (scores >= helmet_conf)
+        m_person = ((classes == ID_G_PERSON) | (classes == ID_PERSON_LOW)) & (scores >= person_conf)
+        
+        m_other = (~((classes == ID_REFLECTIVE_VEST) | (classes == ID_X_BAND) | 
+                     (classes == ID_H_HELMET) | (classes == ID_H_NO_HELMET) | 
+                     (classes == ID_G_PERSON) | (classes == ID_PERSON_LOW))) & (scores >= main_conf)
+                     
+        d_signal_res = raw_dets[m_signal]
+        d_helmet_res = raw_dets[m_helmet]
+        
+        m_main_total = m_signal | m_person | m_other
+        d_main_res = raw_dets[m_main_total]
+        
+    # [핵심 병렬화] 메인 스레드에 있던 이벤트 검지 및 렌더링을 워커 스레드로 이관
+    t_signalman = cam.trk_signalman.update(d_signal_res)
+    t_main, t_helmet, t_signalman, alarms, new_events = cam.run_logic(fr, fid, d_main_res, d_helmet_res, t_signalman)
     
-    # [수정] 신호수 마스크에 5번(기존 조끼)과 7번(x반도)을 모두 신호수 객체로 포함시킵니다.
-    m_signal = ((classes == ID_REFLECTIVE_VEST) | (classes == ID_X_BAND)) & (scores >= person_conf)
+    recorded_fr = fr.copy()
+    recorded_fr = cam.draw(recorded_fr, t_main, t_helmet, t_signalman, alarms, True)
     
-    m_helmet = ((classes == ID_H_HELMET) | (classes == ID_H_NO_HELMET)) & (scores >= helmet_conf)
-    m_person = ((classes == ID_G_PERSON) | (classes == ID_PERSON_LOW)) & (scores >= person_conf)
-    
-    # 메인 객체(차량 등) 마스크
-    m_other = (~((classes == ID_REFLECTIVE_VEST) | (classes == ID_X_BAND) | 
-                 (classes == ID_H_HELMET) | (classes == ID_H_NO_HELMET) | 
-                 (classes == ID_G_PERSON) | (classes == ID_PERSON_LOW))) & (scores >= main_conf)
-                 
-    d_signal_res = raw_dets[m_signal]
-    d_helmet_res = raw_dets[m_helmet]
-    
-    m_main_total = m_signal | m_person | m_other
-    d_main_res = raw_dets[m_main_total]
+    cam.recorder.update(recorded_fr)
                 
-    return idx, fr, fid, d_main_res, d_helmet_res, d_signal_res, True
+    return idx, fid, fr, recorded_fr, new_events, True
 
 def deep_merge_dict(base, override):
     """딕셔너리를 깊은 병합(Deep Merge)하는 유틸리티 함수"""
@@ -1637,42 +1645,39 @@ EVENT_REGISTRY = {
 # [9] 터미널 마법사 및 설정 UI
 # ==========================================
 def capture_snapshot(url):
-    """설정 마법사용 스냅샷 캡처 (GStreamer 및 프레임 무결성 검증 적용)"""
-    pipeline = (
-        f"urisourcebin uri={sanitize_camera_url(url)} ! "
-        f"queue max-size-buffers=2 ! "
-        f"decodebin ! "
-        f"videoconvert ! video/x-raw, format=BGR ! "
-        f"appsink drop=true max-buffers=2 sync=false"
-    )
-    
+    """설정 마법사용 스냅샷 캡처 (FFMPEG 빠른 타임아웃 + 무결성 검증 유지)"""
+    # [수정] 마법사에서는 HW 가속이 불필요하므로, 연결 실패 시 3초 만에 끊어주는 FFMPEG으로 롤백합니다.
+    # (상단 os.environ의 stimeout=3000000 옵션이 자동으로 적용되어 무한 대기(Hang)를 방지합니다.)
     try:
-        # FFMPEG 대신 하드웨어 가속이 적용된 GStreamer 파이프라인 사용
-        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        cap = cv2.VideoCapture(sanitize_camera_url(url), cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # 버퍼 최소화로 지연율 감소
         
         if not cap.isOpened(): 
             return None
             
         valid_frame = None
         
-        # 최대 60프레임(RTSP 딜레이 고려 약 2~4초)을 읽어보며 정상적인 I-프레임을 대기합니다.
-        for _ in range(60):
+        # [핵심] FFMPEG 환경에서도 디코더 웜업(회색/초록 화면 패스) 수행
+        # CPU 디코딩은 버퍼를 비우는 속도가 빠르므로 15프레임 정도만 빠르게 버립니다.
+        for _ in range(15): 
+            cap.read()
+            
+        # 이후 유효 프레임 탐색
+        for _ in range(30):
             ret, frame = cap.read()
             if not ret or frame is None:
                 continue
                 
-            # [핵심] 프레임 무결성 검증 로직
-            # 깨진 회색, 초록색 화면이나 실루엣만 남은 화면은 색상 및 명암의 분산이 매우 낮습니다.
             _, stddev = cv2.meanStdDev(frame)
             mean_std = stddev.mean()
             
-            # 픽셀 표준편차가 15.0 이상이면 유의미한 시각적 디테일(정상 이미지)이 있다고 판단합니다.
-            if mean_std > 15.0:
-                valid_frame = frame
+            # 깨진 실루엣 잔상 방어 (표준편차 25.0 이상)
+            if mean_std > 25.0:
+                # 마법사 UI 정규화를 위해 1280x720으로 스케일링하여 반환
+                valid_frame = cv2.resize(frame, (1280, 720))
                 break
                 
-            # 아직 깨진 프레임이라면 잠시 대기 후 다음 버퍼를 확인합니다.
-            time.sleep(0.05)
+            time.sleep(0.01)
             
         cap.release()
         return valid_frame
@@ -1731,9 +1736,24 @@ def get_roi_points_scaled(frame, title, mode="poly"):
     cv2.destroyWindow(title)
     return normalize_roi_points(pts, orig_w, orig_h)
 
+def gui_safe_input(prompt_text):
+    """OpenCV GUI 창이 '응답 없음' 상태에 빠지지 않도록 이벤트 루프를 유지하며 터미널 입력을 받습니다."""
+    result = []
+    def _read():
+        try: result.append(input(prompt_text))
+        except: result.append("")
+    
+    t = threading.Thread(target=_read, daemon=True)
+    t.start()
+    
+    while t.is_alive():
+        # 50ms마다 GUI 이벤트를 처리하여 OS에 윈도우가 살아있음을 지속적으로 보고합니다.
+        cv2.waitKey(50) 
+        
+    return result[0] if result else ""
+
 def run_wizard_batch_mode(rtsp_list, existing_configs=None):
     logger.info("=== 설정 마법사 시작 ===")
-    # 기존 설정을 그대로 복사하여 기반으로 삼음
     configs = existing_configs.copy() if existing_configs else {}
     
     for i in range(0, len(rtsp_list), BATCH_SIZE):
@@ -1763,10 +1783,13 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
             cv2.rectangle(mosaic, (cx, cy), (cx + 50, cy + 50), (255, 255, 255), -1)
             cv2.putText(mosaic, str(idx + 1), (cx + 10, cy + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 3)
             
+        cv2.namedWindow("Select Cameras", cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty("Select Cameras", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         cv2.imshow("Select Cameras", mosaic)
         cv2.waitKey(1)
         
-        sel = input(f">> [Batch {i//BATCH_SIZE + 1}] 설정할 카메라 번호 (예: 1,3,5 / 건너뛰기: 엔터): ").strip()
+        # [수정] 터미널 입력 시 GUI가 멈추는 것을 방지하기 위해 gui_safe_input 사용
+        sel = gui_safe_input(f">> [Batch {i//BATCH_SIZE + 1}] 설정할 카메라 번호 (예: 1,3,5 / 건너뛰기: 엔터): ").strip()
         if not sel: 
             continue
         
@@ -1778,7 +1801,8 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                     ip = extract_ip(url)
                     
                     print(f"[{ip}] 1.침입 2.주정차 3.안전모 4.횡단 5.신호수차량")
-                    evts = input(f"[{ip}] 이벤트 선택 (예: 1,4): ")
+                    # [수정] 이벤트 선택 입력 안전 처리
+                    evts = gui_safe_input(f"[{ip}] 이벤트 선택 (예: 1,4): ")
                     events = []
                     
                     if '1' in evts: events.append("intrusion")
@@ -1798,7 +1822,8 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                             l = get_roi_points_scaled(frames[n-1], f"Line - CAM: {ip}", mode="line")
                             if len(l) == 2: 
                                 roi_l.extend(l)
-                            if input("횡단 라인을 추가하시겠습니까? (y/n): ") != 'y': 
+                            # [수정] 라인 추가 여부 입력 안전 처리
+                            if gui_safe_input("횡단 라인을 추가하시겠습니까? (y/n): ").strip().lower() != 'y': 
                                 break
                                 
                     configs[ip] = {
@@ -2190,11 +2215,6 @@ class FrameReader:
         threading.Thread(target=self._run, daemon=True).start()
 
     def _get_gstreamer_pipeline(self):
-        """
-        dx-stream의 하드웨어 디코딩 방식을 활용하여 파이썬 앱싱크로 연결하는 GStreamer 파이프라인
-        """
-        # BGR 포맷 변환을 통해 OpenCV와 메모리 배열을 완벽히 일치시킵니다.
-        # queue와 appsink 옵션을 통해 실시간성을 확보하고 메모리 누수를 방지합니다.
         pipeline = (
             f"urisourcebin uri={self.url} ! "
             f"queue max-size-buffers=2 ! "
@@ -3133,7 +3153,7 @@ def main():
         face_model_path = os.path.join(PROJECT_ROOT, SYS_CFG["models"]["FACE"])
         
         # [핵심] 병목 해소를 위해 메인 모델에 NPU 멀티 코어(pool_size=3) 할당
-        d_main = YoLoDeepX(main_model_path, pool_size=3)
+        d_main = YoLoDeepX(main_model_path, pool_size=6)
         
         # 얼굴 모자이크용은 단일 코어 사용 (필요시 조절)
         d_face = YoLoDeepX(face_model_path, pool_size=1) 
@@ -3154,7 +3174,10 @@ def main():
         logger.info(f"Loaded [CAM {i+1}]: {ip}")
 
     # 환경 변수 및 임계값 로드
-    target_fps = SYS_CFG.get("REC_FPS", 15)
+    base_target_fps = SYS_CFG.get("LOOP_FPS", 15)
+    target_fps = base_target_fps
+    fixed_delay = 1.0 / base_target_fps
+    
     main_conf = SYS_CFG["model_confidences"]["MAIN"]
     helmet_conf = SYS_CFG.get("model_confidences", {}).get("HELMET", 0.55)
     person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.35)
@@ -3182,6 +3205,9 @@ def main():
     event_save_queues = {c.ip: [] for c in cams}
     last_event_times = {c.ip: 0.0 for c in cams}
 
+    # [수정] 무한 루프 내부에서 매번 생성/파괴되어 엄청난 지연을 유발하던 스레드 풀을 루프 바깥으로 분리
+    INFERENCE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=len(cams))
+
     try:
         psutil.cpu_percent(interval=None)
         while True:
@@ -3203,6 +3229,23 @@ def main():
 
             loop_count += 1
             
+            if loop_count > 0 and loop_count % 45 == 0 and os.path.exists(config_file):
+                current_mtime = os.path.getmtime(config_file)
+                if current_mtime > last_config_mtime:
+                    logger.info("🛠️ [System] cameras.json 변경 감지. 카메라 설정을 무중단 핫 리로드합니다.")
+                    try:
+                        with open(config_file, 'r', encoding='utf-8') as f:
+                            new_configs = json.load(f)
+                        for c in cams:
+                            if c.ip in new_configs:
+                                c.update_config(new_configs[c.ip])
+                        last_config_mtime = current_mtime
+                    except Exception as e:
+                        logger.error(f"핫 리로드 중 예외 발생: {e}")
+
+            loop_count += 1
+            
+            # [수정] 동적 딜레이의 변동성을 제거하고 긴급 브레이크만 남긴 상태 모니터링
             if loop_count % fps_calc_interval == 0:
                 current_time = time.time()
                 elapsed_time = current_time - last_fps_time
@@ -3210,12 +3253,14 @@ def main():
                 
                 cpu_usage = psutil.cpu_percent(interval=None)
                 
-                if cpu_usage > 85: 
-                    target_fps = max(15, target_fps - 2)
-                elif cpu_usage < 60: 
-                    target_fps = min(15, target_fps + 1)
+                # 상시 15 FPS 고정 유지, CPU 95% 이상 극한 상황에서만 장비 보호를 위해 5 FPS로 스로틀링
+                if cpu_usage > 95.0: 
+                    logger.warning(f"🚨 [과부하 경고] CPU 점유율 {cpu_usage:.1f}% 도달! 장비 보호를 위해 일시적으로 FPS를 낮춥니다.")
+                    target_fps = 5
+                else: 
+                    target_fps = base_target_fps
                     
-                dynamic_delay = 1.0 / target_fps
+                fixed_delay = 1.0 / target_fps
                 
                 if DEBUG_MODE:
                     logger.debug(f"⏱️ [Performance Debug] CPU: {cpu_usage:.1f}% | 실제 속도: {actual_fps:.1f} FPS (목표: {target_fps} FPS)")
@@ -3233,69 +3278,57 @@ def main():
             raw_data = [c.process_frame() for c in cams]
             final_imgs = [None] * len(cams)
             
-            # [핵심 교정] C++ SDK 메모리 오염을 막기 위해 루프 내부에서 with 블록으로 ThreadPool 동기화 강제
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(cams)) as executor:
-                futures = []
-                for idx, res in enumerate(raw_data):
-                    fr, fid, connected = res
-                    
-                    if connected and fr is not None and loop_count % 100 == 0:
-                        try:
-                            small_fr = cv2.resize(fr, (640, 360))
-                            save_path = os.path.join(RAM_DISK_DIR, f"{cams[idx].ip}.jpg")
-                            cv2.imwrite(save_path, small_fr, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                        except Exception:
-                            pass
-                    
-                    if not cams[idx].events:
-                        if connected and fr is not None:
-                            final_imgs[idx] = cams[idx].draw(fr, [], [], [], {}, True)
-                        else:
-                            final_imgs[idx] = cams[idx].draw(None, [], [], [], {}, False)
-                        continue
-                    
-                    if not connected:
-                        final_imgs[idx] = cams[idx].draw(None, [], [], [], {}, False)
-                        continue
-                    
-                    # NPU 멀티 코어 사용을 위한 병렬 스레드 작업 제출
-                    futures.append(executor.submit(
-                        process_camera_task, idx, cams[idx], fr, fid, connected, main_conf, person_conf, helmet_conf
-                    ))
-                    
-                # 비동기 추론 결과 순차 병합 및 로직 실행
-                for future in concurrent.futures.as_completed(futures):
-                    idx, fr, fid, d_main_res, d_helmet_res, d_signal_res, is_valid = future.result()
-                    
-                    if not is_valid:
-                        continue
-                        
-                    # [수정] 래퍼 함수가 순수 넘파이 배열을 반환하므로, 리스트 변환(np.array) 오버헤드 없이 즉시 할당
-                    t_signalman = cams[idx].trk_signalman.update(d_signal_res)
-                    
-                    t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(fr, fid, d_main_res, d_helmet_res, t_signalman)
-                    
+            futures = []
+            for idx, res in enumerate(raw_data):
+                fr, fid, connected = res
+                
+                if connected and fr is not None and loop_count % 100 == 0:
+                    try:
+                        small_fr = cv2.resize(fr, (640, 360))
+                        save_path = os.path.join(RAM_DISK_DIR, f"{cams[idx].ip}.jpg")
+                        cv2.imwrite(save_path, small_fr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    except Exception:
+                        pass
+                
+                if not cams[idx].events:
                     if connected and fr is not None:
-                        recorded_fr = fr.copy()
-                        recorded_fr = cams[idx].draw(recorded_fr, t_main, t_helmet, t_signalman, alarms, True)
-                        
-                        cams[idx].recorder.update(recorded_fr)
-                        
-                        if is_gui_mode:
-                            final_imgs[idx] = recorded_fr
+                        final_imgs[idx] = cams[idx].draw(fr, [], [], [], {}, True)
+                    else:
+                        final_imgs[idx] = cams[idx].draw(None, [], [], [], {}, False)
+                    continue
+                
+                if not connected:
+                    final_imgs[idx] = cams[idx].draw(None, [], [], [], {}, False)
+                    continue
+                
+                # [수정] 스레드 풀에 NPU 추론 및 렌더링 작업 할당
+                futures.append(INFERENCE_POOL.submit(
+                    process_camera_task, idx, cams[idx], fr, fid, connected, main_conf, person_conf, helmet_conf
+                ))
+                
+            # 비동기 병렬 처리 결과 취합
+            for future in concurrent.futures.as_completed(futures):
+                idx, fid, orig_fr, recorded_fr, new_events, is_valid = future.result()
+                
+                if not is_valid:
+                    continue
                     
-                    if new_events:
-                        event_save_queues[cams[idx].ip].append((fid, fr.copy()))
-                        last_event_times[cams[idx].ip] = time.time()
-                        for ev_data in new_events:
-                            api_payload = []
-                            for obj in ev_data['objects']:
-                                api_payload.append({
-                                    "box": obj['box'],
-                                    "label": obj['label'],
-                                    "score": obj['score']
-                                })
-                            logger.info(f"[{cams[idx].ip}] 알람 API 페이로드 덤프 ({ev_data['event_name']}): {json.dumps(api_payload)}")
+                # 렌더링이 완료된 프레임을 GUI 출력용 배열에 삽입
+                if is_gui_mode:
+                    final_imgs[idx] = recorded_fr
+                
+                if new_events:
+                    event_save_queues[cams[idx].ip].append((fid, orig_fr.copy()))
+                    last_event_times[cams[idx].ip] = time.time()
+                    for ev_data in new_events:
+                        api_payload = []
+                        for obj in ev_data['objects']:
+                            api_payload.append({
+                                "box": obj['box'],
+                                "label": obj['label'],
+                                "score": obj['score']
+                            })
+                        logger.info(f"[{cams[idx].ip}] 알람 API 페이로드 덤프 ({ev_data['event_name']}): {json.dumps(api_payload)}")
                                 
             # 5초 지연(Debounce) 만료 체크 및 큐 비우기 (Flush)
             now_time = time.time()
@@ -3318,9 +3351,12 @@ def main():
                 if cv2.waitKey(1) == ord('q'): 
                     break
 
-            sleep_time = dynamic_delay - (time.time() - start_time)
+            processing_time = time.time() - start_time
+            sleep_time = fixed_delay - processing_time
+            
             if sleep_time > 0: 
-                time.sleep(sleep_time)
+                # 파이썬 OS 타이머 오차를 상쇄하기 위해 실제 계산된 시간보다 1ms 덜 재웁니다.
+                time.sleep(max(0.0, sleep_time - 0.001))
 
     except KeyboardInterrupt: 
         logger.info("[종료] 사용자에 의해 시스템이 중단되었습니다.")
