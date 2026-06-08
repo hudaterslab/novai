@@ -10,7 +10,7 @@ logs/*
 *.dxnn
 *.pt
 *.onnx
-CCTV_EVENT_ALERT/events
+CCTV_EVENT_ALERT
 config/system_config.json
 config/cameras.json
 debug_logs
