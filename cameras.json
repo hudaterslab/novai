@@ -1,0 +1,93 @@
+{
+    "173_cam2": {
+        "url": "rtsp://192.168.1.173:8554/cam2",
+        "events": [
+            "no_helmet"
+        ],
+        "roi_poly_norm": [],
+        "roi_lines_norm": []
+    },
+    "173_cam3": {
+        "url": "rtsp://192.168.1.173:8554/cam3",
+        "events": [
+            "no_helmet"
+        ],
+        "roi_poly_norm": [],
+        "roi_lines_norm": []
+    },
+    "173_cam1": {
+        "url": "rtsp://192.168.1.173:8554/cam1",
+        "events": [
+            "no_helmet"
+        ],
+        "roi_poly_norm": [],
+        "roi_lines_norm": []
+    },
+    "173_cam4": {
+        "url": "rtsp://192.168.1.173:8554/cam4",
+        "events": [
+            "no_helmet"
+        ],
+        "roi_poly_norm": [],
+        "roi_lines_norm": []
+    },
+    "173_cam5": {
+        "url": "rtsp://192.168.1.173:8554/cam5",
+        "events": [
+            "no_helmet"
+        ],
+        "roi_poly_norm": [],
+        "roi_lines_norm": []
+    },
+    "173_cam6": {
+        "url": "rtsp://192.168.1.173:8554/cam6",
+        "events": [
+            "conveyor_crossing"
+        ],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [
+            [
+                0.317188,
+                0.022222
+            ],
+            [
+                0.465625,
+                0.955556
+            ]
+        ]
+    },
+    "173_cam7": {
+        "url": "rtsp://192.168.1.173:8554/cam7",
+        "events": [
+            "conveyor_crossing"
+        ],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [
+            [
+                0.178125,
+                0.988889
+            ],
+            [
+                0.742188,
+                0.019444
+            ]
+        ]
+    },
+    "173_cam8": {
+        "url": "rtsp://192.168.1.173:8554/cam8",
+        "events": [
+            "conveyor_crossing"
+        ],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [
+            [
+                0.320312,
+                0.022222
+            ],
+            [
+                0.490625,
+                0.980556
+            ]
+        ]
+    }
+}

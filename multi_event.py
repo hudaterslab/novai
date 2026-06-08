@@ -79,6 +79,43 @@ MIN_APPLY_PERSPECTIVE = 0.0005
 KEEP_LAST_GOOD_ROI_ON_FAILURE = True
 DEBUG_ALIGN = True
 
+# [핵심] 단일 통합 모델의 결과를 클래스별로 분할하는 래퍼 함수 (Numpy Vectorization 최적화)
+def process_camera_task(idx, cam, fr, fid, connected, main_conf, person_conf, helmet_conf):
+    if not connected or fr is None:
+        return idx, fr, fid, np.empty((0,6)), np.empty((0,6)), np.empty((0,6)), False
+                
+    # 가장 낮은 임계값으로 1차 추론 (NPU에서 최대한 많은 객체를 가져옴)
+    base_conf = min(main_conf, person_conf, helmet_conf)
+    raw_dets = cam.det_main.infer(fr, conf_override=base_conf)
+    
+    if len(raw_dets) == 0:
+        return idx, fr, fid, np.empty((0,6)), np.empty((0,6)), np.empty((0,6)), True
+        
+    # Numpy 벡터화를 위한 열(Column) 슬라이싱
+    scores = raw_dets[:, 4]
+    classes = raw_dets[:, 5].astype(int)
+    
+    # 1. 신호수(ID: 5) 마스크
+    m_signal = (classes == ID_REFLECTIVE_VEST) & (scores >= person_conf)
+    # 2. 헬멧/노헬멧(ID: 0, 1) 마스크
+    m_helmet = ((classes == ID_H_HELMET) | (classes == ID_H_NO_HELMET)) & (scores >= helmet_conf)
+    # 3. 사람/하반신(ID: 2, 4) 마스크
+    m_person = ((classes == ID_G_PERSON) | (classes == ID_PERSON_LOW)) & (scores >= person_conf)
+    # 4. 그 외(차량 등) 메인 객체 마스크
+    m_other = (~((classes == ID_REFLECTIVE_VEST) | 
+                 (classes == ID_H_HELMET) | (classes == ID_H_NO_HELMET) | 
+                 (classes == ID_G_PERSON) | (classes == ID_PERSON_LOW))) & (scores >= main_conf)
+                 
+    # 결과 배열 추출 (메모리 연속성 유지)
+    d_signal_res = raw_dets[m_signal]
+    d_helmet_res = raw_dets[m_helmet]
+    
+    # 메인 트래커용 데이터는 신호수, 사람, 기타 메인 객체를 모두 포함해야 함
+    m_main_total = m_signal | m_person | m_other
+    d_main_res = raw_dets[m_main_total]
+                
+    return idx, fr, fid, d_main_res, d_helmet_res, d_signal_res, True
+
 def deep_merge_dict(base, override):
     """딕셔너리를 깊은 병합(Deep Merge)하는 유틸리티 함수"""
     import copy
@@ -180,9 +217,6 @@ def graceful_shutdown():
 
 atexit.register(graceful_shutdown)
 
-# ==========================================
-# [3] 딥엑스 NPU 엔진 및 환경변수 설정
-# ==========================================
 # ==========================================
 # [3] 딥엑스 NPU 엔진 및 환경변수 설정
 # ==========================================
@@ -515,34 +549,33 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         logger.error(f"[EventLogic Error] 이미지 마킹 중 예외 발생: {e}")
 
 # ==========================================
-# [6] DeepX NPU 모델 추론 (엔진 풀링 및 PPU 고속 파싱)
+# [6] DeepX NPU 모델 추론 (공식 SDK 100% 매핑 및 추측성 디코딩 제거)
 # ==========================================
+import queue
+import cv2
+import numpy as np
+import os
+
 class YoLoDeepX:
     def __init__(self, engine_path, pool_size=3):
-        """
-        pool_size: 엣지 디바이스의 가용 NPU 코어 수 (DX-M1 칩셋 기준 보통 2~3 사용)
-        """
         if not HAS_DX_ENGINE:
             raise RuntimeError("dx_engine이 설치되지 않은 환경입니다.")
             
         self.engine_path = engine_path
         self.pool_size = pool_size
         self.engine_pool = queue.Queue(maxsize=pool_size)
-        self.engines_ref = [] # 메모리 해제(Cleanup)를 위한 참조 유지
+        self.engines_ref = [] 
         
         try:
             io = InferenceOption()
-            # [수정 1] NPU 멀티 코어 100% 활용을 위한 다중 엔진 풀(Pool) 생성
             for _ in range(pool_size):
                 engine = InferenceEngine(self.engine_path, io)
                 self.engine_pool.put(engine)
                 self.engines_ref.append(engine)
             
-            # 형태 정보는 첫 번째 엔진에서 추출
             input_info = self.engines_ref[0].get_input_tensors_info()
             shape = input_info[0]["shape"]
             
-            # NHWC vs NCHW 동적 감지
             if len(shape) == 4:
                 if shape[-1] in [1, 3, 4]:
                     self.input_height, self.input_width = shape[1], shape[2]
@@ -553,9 +586,7 @@ class YoLoDeepX:
             else:
                 self.input_height, self.input_width = 640, 640
                 
-            out_info = self.engines_ref[0].get_output_tensors_info()
-            total_bytes = np.prod(out_info[0]["shape"])
-            logger.info(f"💡 [DeepX] {os.path.basename(self.engine_path)} 풀 로드 완료 (코어 할당: {pool_size}개 | 입력: {self.input_width}x{self.input_height} | PPU: {total_bytes} Bytes)")
+            logger.info(f"💡 [DeepX] {os.path.basename(self.engine_path)} 풀 로드 (코어: {pool_size} | 입력: {self.input_width}x{self.input_height})")
                     
         except Exception as e:
             logger.error(f"[DeepX Load Fail] 엔진 초기화 실패 ({engine_path}): {e}")
@@ -565,12 +596,9 @@ class YoLoDeepX:
         self.release()
 
     def release(self):
-        """C++ 런타임 엔진 명시적 메모리 해제"""
         for engine in self.engines_ref:
-            try:
-                del engine
-            except:
-                pass
+            try: del engine
+            except: pass
         self.engines_ref.clear()
                 
     def letter_box(self, img):
@@ -583,7 +611,6 @@ class YoLoDeepX:
         
         dw, dh = (self.input_width - nw) // 2, (self.input_height - nh) // 2
         canvas[dh:dh+nh, dw:dw+nw] = resized
-        
         return canvas, scale, (dw, dh)
 
     def infer(self, img, conf_override=None):
@@ -594,9 +621,7 @@ class YoLoDeepX:
         npu_input, scale, offset = self.letter_box(img)
         dw, dh = offset
         
-        # 엔진 풀에서 가용 코어 하나를 획득 (스레드 세이프)
         engine = self.engine_pool.get()
-        
         try:
             input_tensor = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
             input_tensor = np.expand_dims(input_tensor, axis=0)
@@ -606,84 +631,83 @@ class YoLoDeepX:
             thres = conf_override if conf_override is not None else 0.40
             
             raw_data = output_tensor[0]
-            if isinstance(raw_data, bytes):
-                flat = np.frombuffer(raw_data, dtype=np.uint8)
-            else:
-                flat = np.array(raw_data, copy=False).view(np.uint8).flatten()
             
-            if len(flat) == 0:
+            # C++ 런타임 버퍼 공유(오염) 방지를 위한 명시적 Deep Copy
+            if isinstance(raw_data, bytes):
+                flat = np.frombuffer(raw_data, dtype=np.uint8).copy()
+            else:
+                flat = np.array(raw_data, copy=True).view(np.uint8).flatten()
+            
+            if len(flat) == 0: 
                 return np.empty((0,6))
                 
+            # Stride 검증 (YOLOv8 PPU는 32바이트가 표준이나, 28바이트 패딩 컷 오프 대응)
             stride = 0
             if len(flat) % 32 == 0: stride = 32
             elif len(flat) % 28 == 0: stride = 28
-            elif len(flat) % 24 == 0: stride = 24
-                
-            if stride > 0:
-                num_boxes = len(flat) // stride
-                flat_stride = flat.reshape(num_boxes, stride).copy()
-                
-                # [수정 2] DeepX PPU는 x1, y1, x2, y2를 직결 반환합니다. 중심점(cx, cy) 파싱을 제거합니다.
-                boxes_x1y1x2y2 = np.ascontiguousarray(flat_stride[:, 0:16]).view(np.float32).reshape(num_boxes, 4)
-                
-                # Stride 포맷별 동적 인덱싱 (보통 28바이트의 경우 16~20이 객체도/패딩, 20~24 점수, 24~28 라벨입니다)
-                if stride == 28:
-                    scores = np.ascontiguousarray(flat_stride[:, 20:24]).view(np.float32).flatten()
-                    labels = np.ascontiguousarray(flat_stride[:, 24:28]).view(np.uint32).flatten()
-                else:
-                    # 24, 32 Byte 포맷
-                    scores = np.ascontiguousarray(flat_stride[:, 16:20]).view(np.float32).flatten()
-                    labels = np.ascontiguousarray(flat_stride[:, 20:24]).view(np.uint32).flatten()
-                
-                mask = scores >= thres
-                if not np.any(mask):
-                    return np.empty((0,6))
-                    
-                boxes_x1y1x2y2 = boxes_x1y1x2y2[mask]
-                scores = scores[mask]
-                labels = labels[mask]
-                
-                x1, y1 = boxes_x1y1x2y2[:, 0], boxes_x1y1x2y2[:, 1]
-                x2, y2 = boxes_x1y1x2y2[:, 2], boxes_x1y1x2y2[:, 3]
-                
-                # Class-Aware NMS를 위한 동적 Offset 연산
-                w = x2 - x1
-                h = y2 - y1
-                max_wh = 7680
-                class_offset = labels * max_wh
-                
-                # cv2 NMSBoxes는 [x, y, w, h]를 요구하므로 변환
-                boxes_shifted = np.column_stack([x1 + class_offset, y1 + class_offset, w, h])
-                indices = cv2.dnn.NMSBoxes(boxes_shifted.tolist(), scores.tolist(), thres, 0.45)
-                
-                if len(indices) == 0:
-                    return np.empty((0,6))
-                    
-                keep = np.array(indices).flatten()
-                
-                # 최종 반환 좌표 배열 추출 (원본 x1, y1, x2, y2)
-                x1, y1 = x1[keep], y1[keep]
-                x2, y2 = x2[keep], y2[keep]
-                scores, labels = scores[keep], labels[keep]
-                
-                # 이미지 스케일링 보정
-                x1 = np.clip((x1 - dw) / scale, 0, w_orig)
-                y1 = np.clip((y1 - dh) / scale, 0, h_orig)
-                x2 = np.clip((x2 - dw) / scale, 0, w_orig)
-                y2 = np.clip((y2 - dh) / scale, 0, h_orig)
-                
-                return np.column_stack([x1, y1, x2, y2, scores, labels])
-                
-            else:
-                logger.error(f"⚠️ 지원하지 않는 NPU 버퍼 구조입니다: {len(flat)} bytes")
+            
+            if stride == 0:
+                logger.error(f"⚠️ NPU 버퍼 길이({len(flat)})가 32/28 바이트 포맷과 맞지 않습니다.")
                 return np.empty((0,6))
                 
+            num_boxes = len(flat) // stride
+            flat_stride = flat.reshape(num_boxes, stride)
+            
+            # [핵심 1] 공식 SDK 오프셋 파싱 고정
+            boxes_raw = np.ascontiguousarray(flat_stride[:, :16]).view(np.float32).reshape(-1, 4)
+            scores = np.ascontiguousarray(flat_stride[:, 20:24]).view(np.float32).flatten()
+            labels = np.ascontiguousarray(flat_stride[:, 24:28]).view(np.uint32).flatten()
+            
+            mask = scores >= thres
+            if not np.any(mask): 
+                return np.empty((0,6))
+                
+            boxes_raw = boxes_raw[mask]
+            scores = scores[mask]
+            labels = labels[mask]
+            
+            # [핵심 2] 오토디텍션 폐기 및 YOLOv8 [cx, cy, w, h] 디코딩 수식 강제 적용
+            cx = boxes_raw[:, 0]
+            cy = boxes_raw[:, 1]
+            w = boxes_raw[:, 2]
+            h = boxes_raw[:, 3]
+            
+            x1 = cx - w * 0.5
+            y1 = cy - h * 0.5
+            x2 = cx + w * 0.5
+            y2 = cy + h * 0.5
+            
+            # 단일 모델의 Class-Aware NMS 처리
+            max_wh = 7680
+            class_offset = labels * max_wh
+            boxes_shifted = np.column_stack([x1 + class_offset, y1 + class_offset, w, h])
+            
+            indices = cv2.dnn.NMSBoxes(boxes_shifted.tolist(), scores.tolist(), thres, 0.45)
+            if len(indices) == 0: 
+                return np.empty((0,6))
+                
+            keep = np.array(indices).flatten()
+            
+            # NMS 통과된 BBox 원본 좌표 추출
+            x1_out = x1[keep]
+            y1_out = y1[keep]
+            x2_out = x2[keep]
+            y2_out = y2[keep]
+            scores_out = scores[keep]
+            labels_out = labels[keep]
+            
+            # 원본 이미지 해상도 비율(Letterbox 역변환) 정밀 스케일링
+            x1_out = np.clip((x1_out - dw) / scale, 0, w_orig)
+            y1_out = np.clip((y1_out - dh) / scale, 0, h_orig)
+            x2_out = np.clip((x2_out - dw) / scale, 0, w_orig)
+            y2_out = np.clip((y2_out - dh) / scale, 0, h_orig)
+            
+            return np.column_stack([x1_out, y1_out, x2_out, y2_out, scores_out, labels_out])
+            
         except Exception as e:
             logger.error(f"NPU Inference Error: {e}")
             return np.empty((0,6))
-            
         finally:
-            # [중요] 예외가 발생하더라도 획득했던 엔진은 반드시 풀(Pool)로 반납
             self.engine_pool.put(engine)
 
 # ==========================================
@@ -717,15 +741,21 @@ class SimpleTracker:
                     best_idx = i
                     
             if best_iou > 0.2:
-                # 중심점 좌표 계산 및 히스토리에 누적
+                # 중심점 좌표 계산
                 cx = int((detections[best_idx][0] + detections[best_idx][2]) / 2)
                 cy = int((detections[best_idx][1] + detections[best_idx][3]) / 2)
                 
+                # 💡 bbox, lost와 더불어 conf 최신화 동기화
                 self.tracks[tid].update({
                     'bbox': detections[best_idx][:4], 
                     'lost': 0, 
-                    'conf': detections[best_idx][4]
+                    'conf': float(detections[best_idx][4])
                 })
+                
+                # [방어적 코딩] history 큐가 유실된 트랙 객체가 유입될 경우 자동 복구
+                if 'history' not in self.tracks[tid]:
+                    self.tracks[tid]['history'] = deque(maxlen=self.history_len)
+                    
                 self.tracks[tid]['history'].append((cx, cy))
                 used_dets.add(best_idx)
             else: 
@@ -738,16 +768,26 @@ class SimpleTracker:
             if i not in used_dets:
                 cx = int((det[0] + det[2]) / 2)
                 cy = int((det[1] + det[3]) / 2)
+                
+                # 💡 신규 객체 등록 시 conf 추가 및 history 초기화 
                 self.tracks[self.next_id] = {
-                    'bbox': det[:4], 'lost': 0, 'cls': int(det[5]), 'conf': det[4],
-                    'history': deque([(cx, cy)], maxlen=self.history_len) # 신규 객체 궤적 초기화
+                    'bbox': det[:4], 
+                    'lost': 0, 
+                    'cls': int(det[5]), 
+                    'conf': float(det[4]),
+                    'history': deque([(cx, cy)], maxlen=self.history_len) 
                 }
                 self.next_id += 1
                 
         for tid, trk in self.tracks.items():
             if trk['lost'] == 0:
+                # 💡 [x1, y1, x2, y2, tid, conf, cls] 포맷으로 반환
                 res_tracks.append([*trk['bbox'], tid, trk.get('conf', 1.0), trk['cls']])
                 
+        # [방어적 코딩] 객체가 하나도 없을 경우 빈 리스트에 의한 IndexError 방어용 규격(0, 7) 보장
+        if len(res_tracks) == 0:
+            return np.empty((0, 7))
+            
         return np.array(res_tracks)
 
 class VideoRecorder:
@@ -2977,6 +3017,9 @@ class HealthCheckDaemon:
         if self.thread.is_alive():
             self.thread.join(timeout=2.0)
 
+# ==========================================
+# [12] 메인 프로세스 
+# ==========================================
 def main():
     # 1. argparse를 활용한 실행 옵션 분기 (기본값: CLI 모드)
     parser = argparse.ArgumentParser(description="Raspberry Pi Edge AI CCTV Event Detection")
@@ -3001,13 +3044,19 @@ def main():
     config_file = os.path.join(PROJECT_ROOT, "cameras.json")
     camera_configs = {}
     
-    debug_ans = input(">> 디버그 모드를 활성화하시겠습니까? (상세 로그 출력) [y/N]: ").strip().lower()
-    DEBUG_MODE = True if debug_ans == 'y' else False
+    # 1. 디버그 모드: 기본값 Y (엔터만 쳤을 때 '' 포함)
+    debug_ans = input(">> 디버그 모드를 활성화하시겠습니까? (상세 로그 출력) [Y/n]: ").strip().lower()
+    DEBUG_MODE = True if debug_ans in ['', 'y', 'yes'] else False
+    
     if DEBUG_MODE:
+        # 디버그 모드일 때는 무조건 DEBUG 레벨로 설정하여 상세 로그 출력 보장
+        logger.setLevel(logging.DEBUG)
+        logger.debug("🛠️ 디버그 모드가 활성화되었습니다. 상세 로깅이 시작됩니다.")
+    else:
+        # 비활성화 시에는 SYS_CFG 설정값 사용 (기본값 INFO)
         _log_level_str = SYS_CFG.get("logging", {}).get("level", "INFO").upper()
         logger.setLevel(getattr(logging, _log_level_str, logging.INFO))
-        logger.debug("🛠️ 디버그 모드가 활성화되었습니다. 상세 로깅이 시작됩니다.")
-    
+
     if os.path.exists(config_file):
         try:
             with open(config_file, 'r', encoding='utf-8') as f: 
@@ -3016,21 +3065,25 @@ def main():
             logger.error(f"cameras.json 로드 실패: {e}")
             pass
             
+        # 2. 이벤트 재설정: 기본값 N ('y'나 'yes'를 명시적으로 입력하지 않으면 모두 N으로 간주)
         reset_ans = input(">> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? [y/N]: ").strip().lower()
-        if reset_ans == 'y':
+        
+        if reset_ans in ['y', 'yes']:
             logger.info("기존 설정을 무시하고 터미널 마법사를 실행합니다.")
             camera_configs = run_wizard_batch_mode(rtsp_list, camera_configs)
             try:
                 with open(config_file, 'w', encoding='utf-8') as f: 
                     json.dump(camera_configs, f, indent=4)
-            except: pass
+            except: 
+                pass
     else:
         logger.warning("설정 파일(cameras.json)이 없어 터미널 마법사를 실행합니다.")
         camera_configs = run_wizard_batch_mode(rtsp_list, {})
         try:
             with open(config_file, 'w', encoding='utf-8') as f: 
                 json.dump(camera_configs, f, indent=4)
-        except: pass
+        except: 
+            pass
 
     try:
         logger.info("🔥 [최적화] DeepX 단일 통합 모델을 VPU에 할당 중...")
@@ -3054,15 +3107,16 @@ def main():
         if not conf or not conf.get('events'): continue
         conf['url'] = rtsp
         
-        # [수정] 헬멧, 신호수 파라미터 싹 지우고 통합 모델(d_main) 하나만 넘김
+        # 헬멧, 신호수 파라미터 싹 지우고 통합 모델(d_main) 하나만 넘김
         cams.append(Camera(ip, conf, d_main, d_face, cam_id=i+1))
         logger.info(f"Loaded [CAM {i+1}]: {ip}")
 
-    # 환경 변수 스로틀링 기준
+    # 환경 변수 및 임계값 로드
     target_fps = SYS_CFG.get("REC_FPS", 15)
     main_conf = SYS_CFG["model_confidences"]["MAIN"]
-    helmet_conf = SYS_CFG["model_confidences"]["HELMET"]
-    person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.35)  # [추가] 설정값 로드
+    helmet_conf = SYS_CFG.get("model_confidences", {}).get("HELMET", 0.55)
+    person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.35)
+    
     loop_count = 0
     fps_calc_interval = 30
     last_fps_time = time.time()
@@ -3082,13 +3136,12 @@ def main():
         try: os.makedirs(RAM_DISK_DIR, exist_ok=True)
         except: RAM_DISK_DIR = "./web_frames" 
 
-    # [수정] 카메라별 5초 지연 큐(Debounce Queue) 및 타이머 초기화
+    # 카메라별 5초 지연 큐(Debounce Queue) 및 타이머 초기화
     event_save_queues = {c.ip: [] for c in cams}
     last_event_times = {c.ip: 0.0 for c in cams}
 
     try:
         psutil.cpu_percent(interval=None)
-        
         while True:
             start_time = time.time()
             
@@ -3103,9 +3156,6 @@ def main():
                             if c.ip in new_configs:
                                 c.update_config(new_configs[c.ip])
                         last_config_mtime = current_mtime
-                        
-                        # [추가] 만약 system_config.json 도 함께 체크하거나 리로드 구조가 있다면 
-                        # 여기에서 person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.35) 를 갱신할 수 있습니다.
                     except Exception as e:
                         logger.error(f"핫 리로드 중 예외 발생: {e}")
 
@@ -3139,101 +3189,73 @@ def main():
                     logger.warning(f"⚠️ [System Health] CPU: {cpu_usage:.1f}% | Mem: {mem_usage:.1f}% | API Queue: {q_size}")
             
             raw_data = [c.process_frame() for c in cams]
-            final_imgs = []
+            final_imgs = [None] * len(cams)
             
-            for idx, res in enumerate(raw_data):
-                fr, fid, connected = res
-                
-                if connected and fr is not None and loop_count % 100 == 0:
-                    try:
-                        small_fr = cv2.resize(fr, (640, 360))
-                        save_path = os.path.join(RAM_DISK_DIR, f"{cams[idx].ip}.jpg")
-                        cv2.imwrite(save_path, small_fr, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                    except Exception as e:
-                        pass
-                
-                if not cams[idx].events:
+            # [핵심 교정] C++ SDK 메모리 오염을 막기 위해 루프 내부에서 with 블록으로 ThreadPool 동기화 강제
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(cams)) as executor:
+                futures = []
+                for idx, res in enumerate(raw_data):
+                    fr, fid, connected = res
+                    
+                    if connected and fr is not None and loop_count % 100 == 0:
+                        try:
+                            small_fr = cv2.resize(fr, (640, 360))
+                            save_path = os.path.join(RAM_DISK_DIR, f"{cams[idx].ip}.jpg")
+                            cv2.imwrite(save_path, small_fr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                        except Exception:
+                            pass
+                    
+                    if not cams[idx].events:
+                        if connected and fr is not None:
+                            final_imgs[idx] = cams[idx].draw(fr, [], [], [], {}, True)
+                        else:
+                            final_imgs[idx] = cams[idx].draw(None, [], [], [], {}, False)
+                        continue
+                    
+                    if not connected:
+                        final_imgs[idx] = cams[idx].draw(None, [], [], [], {}, False)
+                        continue
+                    
+                    # NPU 멀티 코어 사용을 위한 병렬 스레드 작업 제출
+                    futures.append(executor.submit(
+                        process_camera_task, idx, cams[idx], fr, fid, connected, main_conf, person_conf, helmet_conf
+                    ))
+                    
+                # 비동기 추론 결과 순차 병합 및 로직 실행
+                for future in concurrent.futures.as_completed(futures):
+                    idx, fr, fid, d_main_res, d_helmet_res, d_signal_res, is_valid = future.result()
+                    
+                    if not is_valid:
+                        continue
+                        
+                    # [수정] 래퍼 함수가 순수 넘파이 배열을 반환하므로, 리스트 변환(np.array) 오버헤드 없이 즉시 할당
+                    t_signalman = cams[idx].trk_signalman.update(d_signal_res)
+                    
+                    t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(fr, fid, d_main_res, d_helmet_res, t_signalman)
+                    
                     if connected and fr is not None:
-                        final_imgs.append(cams[idx].draw(fr, [], [], {}, True))
-                    else:
-                        final_imgs.append(cams[idx].draw(None, [], [], {}, False))
-                    continue
-                
-                if not connected:
-                    final_imgs.append(cams[idx].draw(None, [], [], {}, False))
-                    continue
-                
-                # ---------------------------------------------------------
-                # [수정] 사람(2) 및 신호수(5) 클래스 전용 Confidence 개별 적용
-                # ---------------------------------------------------------
-                base_conf = min(main_conf, person_conf, helmet_conf)
-                raw_dets = cams[idx].det_main.infer(fr, conf_override=base_conf)
-                
-                d_main_res_list = []
-                d_helmet_res = []
-                d_signal_res = []
-                
-                # 파이썬 리스트 컴프리헨션 수준에서 클래스별로 결과를 쪼개서 분배합니다. (NPU 병목 해소)
-                for d in raw_dets:
-                    cls_id = int(d[5])
-                    conf = float(d[4])
+                        recorded_fr = fr.copy()
+                        recorded_fr = cams[idx].draw(recorded_fr, t_main, t_helmet, t_signalman, alarms, True)
+                        
+                        cams[idx].recorder.update(recorded_fr)
+                        
+                        if is_gui_mode:
+                            final_imgs[idx] = recorded_fr
                     
-                    if cls_id == ID_REFLECTIVE_VEST: # 신호수(5)
-                        if conf >= person_conf:
-                            d_main_res_list.append(d) 
-                            d_signal_res.append(d)
-                    elif cls_id in [ID_H_HELMET, ID_H_NO_HELMET]: # 헬멧(0, 1)
-                        if conf >= helmet_conf:
-                            d_helmet_res.append(d)
-                    elif cls_id in [ID_G_PERSON, ID_PERSON_LOW]: # 사람(2, 4)
-                        if conf >= person_conf:
-                            d_main_res_list.append(d)
-                    else: # 차량 등(3, 6)
-                        if conf >= main_conf:
-                            d_main_res_list.append(d)
-                            
-                t_main_input = np.array(d_main_res_list) if len(d_main_res_list) > 0 else np.empty((0, 6))
-                
-                # 쪼개진 데이터를 각각의 트래커에 던져줍니다.
-                t_signalman = cams[idx].trk_signalman.update(d_signal_res)
-                
-                t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(
-                    fr, fid, t_main_input, d_helmet_res, t_signalman
-                )
-                
-                # -----------------------------------------------------------
-                # BBox와 알람이 그려진 프레임을 생성하여 녹화기에 주입
-                # -----------------------------------------------------------
-                if connected and fr is not None:
-                    recorded_fr = fr.copy()
-                    recorded_fr = cams[idx].draw(recorded_fr, t_main, t_helmet, t_signalman, alarms, True)
-                    
-                    cams[idx].recorder.update(recorded_fr)
-                    
-                    if is_gui_mode:
-                        final_imgs.append(recorded_fr)
-                else:
-                    if is_gui_mode:
-                        final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
-                # -----------------------------------------------------------
-                    
-                if new_events:
-                    # [수정] 디스크에 바로 쓰지 않고, 큐에 스택(Stacking)하며 이벤트 시간 갱신
-                    # 메인 루프 참조 문제 방지를 위해 fr.copy() 사용
-                    event_save_queues[cams[idx].ip].append((fid, fr.copy()))
-                    last_event_times[cams[idx].ip] = time.time()
-                    
-                    for ev_data in new_events:
-                        api_payload = []
-                        for obj in ev_data['objects']:
-                            api_payload.append({
-                                "box": obj['box'],
-                                "label": obj['label'],
-                                "score": obj['score']
-                            })
-                        logger.info(f"[{cams[idx].ip}] 알람 API 페이로드 덤프 ({ev_data['event_name']}): {json.dumps(api_payload)}")
-
-            # [수정] 5초 지연(Debounce) 만료 체크 및 큐 비우기 (Flush)
+                    if new_events:
+                        event_save_queues[cams[idx].ip].append((fid, fr.copy()))
+                        last_event_times[cams[idx].ip] = time.time()
+                        for ev_data in new_events:
+                            api_payload = []
+                            for obj in ev_data['objects']:
+                                api_payload.append({
+                                    "box": obj['box'],
+                                    "label": obj['label'],
+                                    "score": obj['score']
+                                })
+                            logger.info(f"[{cams[idx].ip}] 알람 API 페이로드 덤프 ({ev_data['event_name']}): {json.dumps(api_payload)}")
+                                
+            # 5초 지연(Debounce) 만료 체크 및 큐 비우기 (Flush)
             now_time = time.time()
             for c in cams:
                 ip = c.ip
@@ -3271,7 +3293,7 @@ def main():
             c.reader.running = False
             c.recorder.running = False
             
-        # [추가] 프로세스 종료 시 C++ 엔진 명시적 파괴 (메모리 누수 방어)
+        # 프로세스 종료 시 C++ 엔진 명시적 파괴 (메모리 누수 방어)
         logger.info("🔄 [SYSTEM] NPU 메모리를 안전하게 해제합니다...")
         if 'd_main' in locals(): d_main.release()
         if 'd_face' in locals(): d_face.release()
