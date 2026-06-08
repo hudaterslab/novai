@@ -1637,15 +1637,46 @@ EVENT_REGISTRY = {
 # [9] 터미널 마법사 및 설정 UI
 # ==========================================
 def capture_snapshot(url):
-    """설정 마법사용 스냅샷 캡처"""
+    """설정 마법사용 스냅샷 캡처 (GStreamer 및 프레임 무결성 검증 적용)"""
+    pipeline = (
+        f"urisourcebin uri={sanitize_camera_url(url)} ! "
+        f"queue max-size-buffers=2 ! "
+        f"decodebin ! "
+        f"videoconvert ! video/x-raw, format=BGR ! "
+        f"appsink drop=true max-buffers=2 sync=false"
+    )
+    
     try:
-        cap = cv2.VideoCapture(sanitize_camera_url(url), cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # FFMPEG 대신 하드웨어 가속이 적용된 GStreamer 파이프라인 사용
+        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        
         if not cap.isOpened(): 
             return None
-        ret, frame = cap.read()
+            
+        valid_frame = None
+        
+        # 최대 60프레임(RTSP 딜레이 고려 약 2~4초)을 읽어보며 정상적인 I-프레임을 대기합니다.
+        for _ in range(60):
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                continue
+                
+            # [핵심] 프레임 무결성 검증 로직
+            # 깨진 회색, 초록색 화면이나 실루엣만 남은 화면은 색상 및 명암의 분산이 매우 낮습니다.
+            _, stddev = cv2.meanStdDev(frame)
+            mean_std = stddev.mean()
+            
+            # 픽셀 표준편차가 15.0 이상이면 유의미한 시각적 디테일(정상 이미지)이 있다고 판단합니다.
+            if mean_std > 15.0:
+                valid_frame = frame
+                break
+                
+            # 아직 깨진 프레임이라면 잠시 대기 후 다음 버퍼를 확인합니다.
+            time.sleep(0.05)
+            
         cap.release()
-        return frame if ret else None
+        return valid_frame
+        
     except Exception as e:
         logger.error(f"스냅샷 캡처 실패: {e}")
         return None
@@ -2158,22 +2189,38 @@ class FrameReader:
         
         threading.Thread(target=self._run, daemon=True).start()
 
+    def _get_gstreamer_pipeline(self):
+        """
+        dx-stream의 하드웨어 디코딩 방식을 활용하여 파이썬 앱싱크로 연결하는 GStreamer 파이프라인
+        """
+        # BGR 포맷 변환을 통해 OpenCV와 메모리 배열을 완벽히 일치시킵니다.
+        # queue와 appsink 옵션을 통해 실시간성을 확보하고 메모리 누수를 방지합니다.
+        pipeline = (
+            f"urisourcebin uri={self.url} ! "
+            f"queue max-size-buffers=2 ! "
+            f"decodebin ! "
+            f"videoconvert ! video/x-raw, format=BGR ! "
+            f"appsink drop=true max-buffers=2 sync=false"
+        )
+        return pipeline
+
     def _run(self):
         while self.running:
-            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            # FFMPEG 대신 GSTREAMER 백엔드 사용
+            pipeline_str = self._get_gstreamer_pipeline()
+            cap = cv2.VideoCapture(pipeline_str, cv2.CAP_GSTREAMER)
+            
             if not cap.isOpened(): 
-                # 💡 [수정] 초기 연결 실패 로깅 (디버그 모드일때만 빈도수 조절하여 출력하도록 권장하나, 연결 실패는 중요하므로 error 처리)
-                logger.error(f"🚨 [CAM:{self.ip}] RTSP 연결 실패. 5초 후 재시도합니다.")
+                logger.error(f"🚨 [CAM:{self.ip}] GStreamer RTSP 연결 실패. 파이프라인 설정을 확인하세요. 5초 후 재시도합니다.")
                 time.sleep(5)
                 continue
                 
             self.connected = True
-            logger.info(f"✅ [CAM:{self.ip}] 카메라 스트림 연결 성공.")
+            logger.info(f"✅ [CAM:{self.ip}] GStreamer 하드웨어 가속 스트림 연결 성공.")
             self.last_t = time.time()
             
             while self.running and cap.isOpened():
                 if time.time() - self.last_t > WATCHDOG_TIMEOUT: 
-                    # 💡 [수정] 타임아웃 로깅 레벨 격상
                     logger.error(f"🚨 [CAM:{self.ip}] 카메라 수신 타임아웃({WATCHDOG_TIMEOUT}s). 재연결을 시도합니다.")
                     break
                     
@@ -2183,6 +2230,7 @@ class FrameReader:
                     break
                     
                 if fr is not None:
+                    # 필요시 해상도 제한 (파이프라인 단계에서 videoscale 플러그인을 추가하는 것도 좋습니다)
                     if fr.shape[1] > 720: 
                         ratio = 720 / fr.shape[1]
                         fr = cv2.resize(fr, (720, int(fr.shape[0] * ratio)), interpolation=cv2.INTER_NEAREST)
@@ -2190,7 +2238,8 @@ class FrameReader:
                         self.frame = fr
                         self.fid += 1
                         self.last_t = time.time()
-                time.sleep(0.005)
+                        
+                time.sleep(0.005) # CPU 점유율 안정화
                 
             self.connected = False
             try: cap.release()
@@ -3162,7 +3211,7 @@ def main():
                 cpu_usage = psutil.cpu_percent(interval=None)
                 
                 if cpu_usage > 85: 
-                    target_fps = max(5, target_fps - 2)
+                    target_fps = max(15, target_fps - 2)
                 elif cpu_usage < 60: 
                     target_fps = min(15, target_fps + 1)
                     
