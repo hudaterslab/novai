@@ -47,6 +47,7 @@ ID_G_CAR = 3
 ID_PERSON_LOW = 4
 ID_REFLECTIVE_VEST = 5
 ID_G_TRUCK = 6
+ID_X_BAND = 7
 TARGET_VEHICLES = [ID_G_CAR, ID_G_TRUCK]
 
 DEBUG_MODE = False
@@ -84,33 +85,29 @@ def process_camera_task(idx, cam, fr, fid, connected, main_conf, person_conf, he
     if not connected or fr is None:
         return idx, fr, fid, np.empty((0,6)), np.empty((0,6)), np.empty((0,6)), False
                 
-    # 가장 낮은 임계값으로 1차 추론 (NPU에서 최대한 많은 객체를 가져옴)
     base_conf = min(main_conf, person_conf, helmet_conf)
     raw_dets = cam.det_main.infer(fr, conf_override=base_conf)
     
     if len(raw_dets) == 0:
         return idx, fr, fid, np.empty((0,6)), np.empty((0,6)), np.empty((0,6)), True
         
-    # Numpy 벡터화를 위한 열(Column) 슬라이싱
     scores = raw_dets[:, 4]
     classes = raw_dets[:, 5].astype(int)
     
-    # 1. 신호수(ID: 5) 마스크
-    m_signal = (classes == ID_REFLECTIVE_VEST) & (scores >= person_conf)
-    # 2. 헬멧/노헬멧(ID: 0, 1) 마스크
+    # [수정] 신호수 마스크에 5번(기존 조끼)과 7번(x반도)을 모두 신호수 객체로 포함시킵니다.
+    m_signal = ((classes == ID_REFLECTIVE_VEST) | (classes == ID_X_BAND)) & (scores >= person_conf)
+    
     m_helmet = ((classes == ID_H_HELMET) | (classes == ID_H_NO_HELMET)) & (scores >= helmet_conf)
-    # 3. 사람/하반신(ID: 2, 4) 마스크
     m_person = ((classes == ID_G_PERSON) | (classes == ID_PERSON_LOW)) & (scores >= person_conf)
-    # 4. 그 외(차량 등) 메인 객체 마스크
-    m_other = (~((classes == ID_REFLECTIVE_VEST) | 
+    
+    # 메인 객체(차량 등) 마스크
+    m_other = (~((classes == ID_REFLECTIVE_VEST) | (classes == ID_X_BAND) | 
                  (classes == ID_H_HELMET) | (classes == ID_H_NO_HELMET) | 
                  (classes == ID_G_PERSON) | (classes == ID_PERSON_LOW))) & (scores >= main_conf)
                  
-    # 결과 배열 추출 (메모리 연속성 유지)
     d_signal_res = raw_dets[m_signal]
     d_helmet_res = raw_dets[m_helmet]
     
-    # 메인 트래커용 데이터는 신호수, 사람, 기타 메인 객체를 모두 포함해야 함
     m_main_total = m_signal | m_person | m_other
     d_main_res = raw_dets[m_main_total]
                 
@@ -549,7 +546,7 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         logger.error(f"[EventLogic Error] 이미지 마킹 중 예외 발생: {e}")
 
 # ==========================================
-# [6] DeepX NPU 모델 추론 (공식 SDK 100% 매핑 및 추측성 디코딩 제거)
+# [6] DeepX NPU 모델 추론 (공식 YOLOv8 PPU 디코더 완벽 롤백)
 # ==========================================
 import queue
 import cv2
@@ -641,19 +638,15 @@ class YoLoDeepX:
             if len(flat) == 0: 
                 return np.empty((0,6))
                 
-            # Stride 검증 (YOLOv8 PPU는 32바이트가 표준이나, 28바이트 패딩 컷 오프 대응)
-            stride = 0
-            if len(flat) % 32 == 0: stride = 32
-            elif len(flat) % 28 == 0: stride = 28
-            
-            if stride == 0:
-                logger.error(f"⚠️ NPU 버퍼 길이({len(flat)})가 32/28 바이트 포맷과 맞지 않습니다.")
+            stride = 32
+            if len(flat) % stride != 0:
+                logger.error(f"⚠️ NPU 버퍼 길이({len(flat)})가 32의 배수가 아닙니다.")
                 return np.empty((0,6))
                 
             num_boxes = len(flat) // stride
             flat_stride = flat.reshape(num_boxes, stride)
             
-            # [핵심 1] 공식 SDK 오프셋 파싱 고정
+            # [핵심] DeepX 공식 SDK에 명시된 오프셋 파싱 고정
             boxes_raw = np.ascontiguousarray(flat_stride[:, :16]).view(np.float32).reshape(-1, 4)
             scores = np.ascontiguousarray(flat_stride[:, 20:24]).view(np.float32).flatten()
             labels = np.ascontiguousarray(flat_stride[:, 24:28]).view(np.uint32).flatten()
@@ -666,7 +659,7 @@ class YoLoDeepX:
             scores = scores[mask]
             labels = labels[mask]
             
-            # [핵심 2] 오토디텍션 폐기 및 YOLOv8 [cx, cy, w, h] 디코딩 수식 강제 적용
+            # [핵심] 순수 YOLOv8 공식 디코딩 수식 적용
             cx = boxes_raw[:, 0]
             cy = boxes_raw[:, 1]
             w = boxes_raw[:, 2]
@@ -688,7 +681,7 @@ class YoLoDeepX:
                 
             keep = np.array(indices).flatten()
             
-            # NMS 통과된 BBox 원본 좌표 추출
+            # NMS 통과된 BBox 추출
             x1_out = x1[keep]
             y1_out = y1[keep]
             x2_out = x2[keep]
