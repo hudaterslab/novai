@@ -515,29 +515,37 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         logger.error(f"[EventLogic Error] 이미지 마킹 중 예외 발생: {e}")
 
 # ==========================================
-# [6] DeepX NPU 모델 추론 (PPU 고속 파싱 및 Class-Aware NMS 결합)
+# [6] DeepX NPU 모델 추론 (엔진 풀링 및 PPU 고속 파싱)
 # ==========================================
 class YoLoDeepX:
-    def __init__(self, engine_path):
+    def __init__(self, engine_path, pool_size=3):
+        """
+        pool_size: 엣지 디바이스의 가용 NPU 코어 수 (DX-M1 칩셋 기준 보통 2~3 사용)
+        """
         if not HAS_DX_ENGINE:
-            raise RuntimeError("dx_engine이 설치되지 않은 서버/PC 환경에서는 YoLoDeepX(NPU) 객체를 생성할 수 없습니다.")
+            raise RuntimeError("dx_engine이 설치되지 않은 환경입니다.")
             
         self.engine_path = engine_path
-        self.engine = None
+        self.pool_size = pool_size
+        self.engine_pool = queue.Queue(maxsize=pool_size)
+        self.engines_ref = [] # 메모리 해제(Cleanup)를 위한 참조 유지
         
         try:
             io = InferenceOption()
-            self.engine = InferenceEngine(self.engine_path, io)
+            # [수정 1] NPU 멀티 코어 100% 활용을 위한 다중 엔진 풀(Pool) 생성
+            for _ in range(pool_size):
+                engine = InferenceEngine(self.engine_path, io)
+                self.engine_pool.put(engine)
+                self.engines_ref.append(engine)
             
-            # NHWC vs NCHW 레이아웃 동적 감지를 통한 정확한 해상도 추출
-            input_info = self.engine.get_input_tensors_info()
+            # 형태 정보는 첫 번째 엔진에서 추출
+            input_info = self.engines_ref[0].get_input_tensors_info()
             shape = input_info[0]["shape"]
             
+            # NHWC vs NCHW 동적 감지
             if len(shape) == 4:
-                # 마지막 차원이 채널(1, 3, 4)인 경우 NHWC 포맷: [Batch, Height, Width, Channels]
                 if shape[-1] in [1, 3, 4]:
                     self.input_height, self.input_width = shape[1], shape[2]
-                # NCHW 포맷인 경우: [Batch, Channels, Height, Width]
                 else:
                     self.input_height, self.input_width = shape[2], shape[3]
             elif len(shape) == 3:
@@ -545,9 +553,9 @@ class YoLoDeepX:
             else:
                 self.input_height, self.input_width = 640, 640
                 
-            out_info = self.engine.get_output_tensors_info()
+            out_info = self.engines_ref[0].get_output_tensors_info()
             total_bytes = np.prod(out_info[0]["shape"])
-            logger.info(f"💡 [DeepX] {os.path.basename(self.engine_path)} 로드 완료 (입력: {self.input_width}x{self.input_height}, PPU: {total_bytes} Bytes)")
+            logger.info(f"💡 [DeepX] {os.path.basename(self.engine_path)} 풀 로드 완료 (코어 할당: {pool_size}개 | 입력: {self.input_width}x{self.input_height} | PPU: {total_bytes} Bytes)")
                     
         except Exception as e:
             logger.error(f"[DeepX Load Fail] 엔진 초기화 실패 ({engine_path}): {e}")
@@ -558,12 +566,12 @@ class YoLoDeepX:
 
     def release(self):
         """C++ 런타임 엔진 명시적 메모리 해제"""
-        if hasattr(self, 'engine') and self.engine is not None:
+        for engine in self.engines_ref:
             try:
-                del self.engine
-                self.engine = None
+                del engine
             except:
                 pass
+        self.engines_ref.clear()
                 
     def letter_box(self, img):
         h, w = img.shape[:2]
@@ -586,13 +594,15 @@ class YoLoDeepX:
         npu_input, scale, offset = self.letter_box(img)
         dw, dh = offset
         
+        # 엔진 풀에서 가용 코어 하나를 획득 (스레드 세이프)
+        engine = self.engine_pool.get()
+        
         try:
-            # C++ 바인딩 오류(FATAL) 방지를 위한 메모리 연속성 및 데이터 타입 보장
             input_tensor = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
             input_tensor = np.expand_dims(input_tensor, axis=0)
             input_tensor = np.ascontiguousarray(input_tensor, dtype=np.uint8)
             
-            output_tensor = self.engine.run([input_tensor])
+            output_tensor = engine.run([input_tensor])
             thres = conf_override if conf_override is not None else 0.40
             
             raw_data = output_tensor[0]
@@ -604,56 +614,59 @@ class YoLoDeepX:
             if len(flat) == 0:
                 return np.empty((0,6))
                 
-            # Stride 크기에 따른 동적 파싱 (버전 호환성)
             stride = 0
-            if len(flat) % 32 == 0:
-                stride = 32
-            elif len(flat) % 28 == 0:
-                stride = 28
+            if len(flat) % 32 == 0: stride = 32
+            elif len(flat) % 28 == 0: stride = 28
+            elif len(flat) % 24 == 0: stride = 24
                 
             if stride > 0:
                 num_boxes = len(flat) // stride
                 flat_stride = flat.reshape(num_boxes, stride).copy()
                 
-                # Numpy View를 활용한 CPU 병목 제로 파싱
-                cxcywh = np.ascontiguousarray(flat_stride[:, :16]).view(np.float32).reshape(num_boxes, 4)
-                scores = np.ascontiguousarray(flat_stride[:, 20:24]).view(np.float32).flatten()
-                labels = np.ascontiguousarray(flat_stride[:, 24:28]).view(np.uint32).flatten()
+                # [수정 2] DeepX PPU는 x1, y1, x2, y2를 직결 반환합니다. 중심점(cx, cy) 파싱을 제거합니다.
+                boxes_x1y1x2y2 = np.ascontiguousarray(flat_stride[:, 0:16]).view(np.float32).reshape(num_boxes, 4)
                 
-                # Confidence 1차 필터링
+                # Stride 포맷별 동적 인덱싱 (보통 28바이트의 경우 16~20이 객체도/패딩, 20~24 점수, 24~28 라벨입니다)
+                if stride == 28:
+                    scores = np.ascontiguousarray(flat_stride[:, 20:24]).view(np.float32).flatten()
+                    labels = np.ascontiguousarray(flat_stride[:, 24:28]).view(np.uint32).flatten()
+                else:
+                    # 24, 32 Byte 포맷
+                    scores = np.ascontiguousarray(flat_stride[:, 16:20]).view(np.float32).flatten()
+                    labels = np.ascontiguousarray(flat_stride[:, 20:24]).view(np.uint32).flatten()
+                
                 mask = scores >= thres
                 if not np.any(mask):
                     return np.empty((0,6))
                     
-                cxcywh = cxcywh[mask]
+                boxes_x1y1x2y2 = boxes_x1y1x2y2[mask]
                 scores = scores[mask]
                 labels = labels[mask]
                 
-                cx, cy = cxcywh[:, 0], cxcywh[:, 1]
-                w, h = cxcywh[:, 2], cxcywh[:, 3]
+                x1, y1 = boxes_x1y1x2y2[:, 0], boxes_x1y1x2y2[:, 1]
+                x2, y2 = boxes_x1y1x2y2[:, 2], boxes_x1y1x2y2[:, 3]
                 
-                x1 = cx - w * 0.5
-                y1 = cy - h * 0.5
-                
-                # [중요] 단일 통합 모델을 위한 Class-Aware NMS 오프셋 기법 결합
+                # Class-Aware NMS를 위한 동적 Offset 연산
+                w = x2 - x1
+                h = y2 - y1
                 max_wh = 7680
                 class_offset = labels * max_wh
                 
-                # NMSBoxes는 [x, y, w, h] 포맷을 요구합니다
-                boxes_xywh = np.column_stack([x1 + class_offset, y1 + class_offset, w, h])
-                indices = cv2.dnn.NMSBoxes(boxes_xywh.tolist(), scores.tolist(), thres, 0.45)
+                # cv2 NMSBoxes는 [x, y, w, h]를 요구하므로 변환
+                boxes_shifted = np.column_stack([x1 + class_offset, y1 + class_offset, w, h])
+                indices = cv2.dnn.NMSBoxes(boxes_shifted.tolist(), scores.tolist(), thres, 0.45)
                 
                 if len(indices) == 0:
                     return np.empty((0,6))
                     
                 keep = np.array(indices).flatten()
                 
-                # 오리지널 좌표 복원 (Offset 제외된 순수 x1, y1)
+                # 최종 반환 좌표 배열 추출 (원본 x1, y1, x2, y2)
                 x1, y1 = x1[keep], y1[keep]
-                x2, y2 = cx[keep] + w[keep] * 0.5, cy[keep] + h[keep] * 0.5
+                x2, y2 = x2[keep], y2[keep]
                 scores, labels = scores[keep], labels[keep]
                 
-                # 원본 해상도 스케일링 복원
+                # 이미지 스케일링 보정
                 x1 = np.clip((x1 - dw) / scale, 0, w_orig)
                 y1 = np.clip((y1 - dh) / scale, 0, h_orig)
                 x2 = np.clip((x2 - dw) / scale, 0, w_orig)
@@ -668,6 +681,10 @@ class YoLoDeepX:
         except Exception as e:
             logger.error(f"NPU Inference Error: {e}")
             return np.empty((0,6))
+            
+        finally:
+            # [중요] 예외가 발생하더라도 획득했던 엔진은 반드시 풀(Pool)로 반납
+            self.engine_pool.put(engine)
 
 # ==========================================
 # [7] 객체 트래커 및 영상 녹화기
@@ -3020,8 +3037,11 @@ def main():
         main_model_path = os.path.join(PROJECT_ROOT, SYS_CFG["models"]["MAIN"])
         face_model_path = os.path.join(PROJECT_ROOT, SYS_CFG["models"]["FACE"])
         
-        d_main = YoLoDeepX(main_model_path)
-        d_face = YoLoDeepX(face_model_path) 
+        # [핵심] 병목 해소를 위해 메인 모델에 NPU 멀티 코어(pool_size=3) 할당
+        d_main = YoLoDeepX(main_model_path, pool_size=3)
+        
+        # 얼굴 모자이크용은 단일 코어 사용 (필요시 조절)
+        d_face = YoLoDeepX(face_model_path, pool_size=1) 
     except Exception as e:
         logger.error(f"🚨 모델 로드 실패. PPU 컨버전이 완료된 dxnn 파일이 경로에 있는지 확인하십시오: {e}")
         return
