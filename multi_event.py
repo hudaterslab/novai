@@ -105,15 +105,14 @@ def load_system_config():
             "signal_vehicle": {"enabled": False, "cooldown_sec": 600, "motion_threshold_ratio": 0.30}
         },
         "models": {
-            "MAIN": "hanjin_cctv.dxnn",
-            "FACE": "yolov8m-face.dxnn",
-            "HELMET": "helmet_3cls_v8.dxnn"
+            "MAIN": "hanjin_cctv_v2.dxnn",
+            "FACE": "yolov8m-face_ppu.dxnn"
         },
         "model_confidences": {
             "MAIN": 0.6,
             "FACE": 0.35,
             "HELMET": 0.55,
-            "PERSON": 0.35  # [추가] 사람 및 신호수 전용 기본 임계값 설정
+            "PERSON": 0.35  
         },
         "BATCH_SIZE": 9,
         "REC_FPS": 3,
@@ -516,83 +515,68 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         logger.error(f"[EventLogic Error] 이미지 마킹 중 예외 발생: {e}")
 
 # ==========================================
-# [6] DeepX NPU 모델 추론 (YOLOv8 버그 픽스 반영)
+# [6] DeepX NPU 모델 추론 (PPU 고속 파싱 및 Class-Aware NMS 결합)
 # ==========================================
 class YoLoDeepX:
     def __init__(self, engine_path):
-        # [수정] 객체 생성 시점에 NPU 환경인지 체크하여 안전하게 방어
         if not HAS_DX_ENGINE:
             raise RuntimeError("dx_engine이 설치되지 않은 서버/PC 환경에서는 YoLoDeepX(NPU) 객체를 생성할 수 없습니다.")
             
         self.engine_path = engine_path
+        self.engine = None
+        
         try:
             io = InferenceOption()
             self.engine = InferenceEngine(self.engine_path, io)
-            logger.info(f"[DeepX] 모델 로드 성공: {os.path.basename(self.engine_path)}")
+            
+            # NHWC vs NCHW 레이아웃 동적 감지를 통한 정확한 해상도 추출
+            input_info = self.engine.get_input_tensors_info()
+            shape = input_info[0]["shape"]
+            
+            if len(shape) == 4:
+                # 마지막 차원이 채널(1, 3, 4)인 경우 NHWC 포맷: [Batch, Height, Width, Channels]
+                if shape[-1] in [1, 3, 4]:
+                    self.input_height, self.input_width = shape[1], shape[2]
+                # NCHW 포맷인 경우: [Batch, Channels, Height, Width]
+                else:
+                    self.input_height, self.input_width = shape[2], shape[3]
+            elif len(shape) == 3:
+                self.input_height, self.input_width = shape[0], shape[1]
+            else:
+                self.input_height, self.input_width = 640, 640
+                
+            out_info = self.engine.get_output_tensors_info()
+            total_bytes = np.prod(out_info[0]["shape"])
+            logger.info(f"💡 [DeepX] {os.path.basename(self.engine_path)} 로드 완료 (입력: {self.input_width}x{self.input_height}, PPU: {total_bytes} Bytes)")
+                    
         except Exception as e:
             logger.error(f"[DeepX Load Fail] 엔진 초기화 실패 ({engine_path}): {e}")
             raise e
 
-    def letter_box(self, img, new_shape=(640,640)):
+    def __del__(self):
+        self.release()
+
+    def release(self):
+        """C++ 런타임 엔진 명시적 메모리 해제"""
+        if hasattr(self, 'engine') and self.engine is not None:
+            try:
+                del self.engine
+                self.engine = None
+            except:
+                pass
+                
+    def letter_box(self, img):
         h, w = img.shape[:2]
-        scale = min(new_shape[0]/h, new_shape[1]/w)
-        nw, nh = int(w*scale), int(h*scale)
+        scale = min(self.input_height / h, self.input_width / w)
+        nw, nh = int(w * scale), int(h * scale)
         
         resized = cv2.resize(img, (nw, nh))
-        canvas = np.full((new_shape[0], new_shape[1], 3), 114, dtype=np.uint8)
+        canvas = np.full((self.input_height, self.input_width, 3), 114, dtype=np.uint8)
         
-        dw, dh = (new_shape[1] - nw) // 2, (new_shape[0] - nh) // 2
+        dw, dh = (self.input_width - nw) // 2, (self.input_height - nh) // 2
         canvas[dh:dh+nh, dw:dw+nw] = resized
         
         return canvas, scale, (dw, dh)
-
-    def postprocess(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
-        try:
-            pred = np.array(output_tensor[0])
-            
-            # YOLOv8 배열 형태 보정
-            if pred.ndim == 3 and pred.shape[1] < pred.shape[2]: 
-                pred = pred.transpose((0, 2, 1))
-            if pred.ndim == 3: 
-                pred = pred[0]
-            
-            # Class-Id 및 Score 추출
-            scores = np.max(pred[:, 4:], axis=1)
-            class_ids = np.argmax(pred[:, 4:], axis=1)
-
-            # Confidence 필터링
-            mask = scores > conf_thres
-            pred = pred[mask]
-            scores = scores[mask]
-            class_ids = class_ids[mask]
-            
-            if len(pred) == 0: 
-                return []
-
-            # NMSBoxes 포맷 맞춤 (x_min, y_min, width, height)
-            boxes_xywh = pred[:, :4].copy()
-            boxes_xywh[:, 0] = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2  # 중심 X -> 최소 X
-            boxes_xywh[:, 1] = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2  # 중심 Y -> 최소 Y
-            
-            # Class-Aware NMS
-            max_wh = 7680 
-            class_offset = class_ids * max_wh
-            boxes_shifted = boxes_xywh.copy()
-            boxes_shifted[:, 0] += class_offset
-            boxes_shifted[:, 1] += class_offset
-            
-            indices = cv2.dnn.NMSBoxes(boxes_shifted.tolist(), scores.tolist(), conf_thres, iou_thres)
-            
-            results = []
-            if len(indices) > 0:
-                for i in indices.flatten():
-                    x_min, y_min, w, h = boxes_xywh[i]
-                    results.append([[x_min, y_min, x_min + w, y_min + h], scores[i], class_ids[i]])
-                    
-            return results
-        except Exception as e:
-            logger.error(f"NPU Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
-            return []
 
     def infer(self, img, conf_override=None):
         if img is None: 
@@ -600,29 +584,87 @@ class YoLoDeepX:
             
         h_orig, w_orig = img.shape[:2]
         npu_input, scale, offset = self.letter_box(img)
-        npu_input_rgb = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
+        dw, dh = offset
         
         try:
-            output_tensor = self.engine.run([npu_input_rgb])
+            # C++ 바인딩 오류(FATAL) 방지를 위한 메모리 연속성 및 데이터 타입 보장
+            input_tensor = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
+            input_tensor = np.expand_dims(input_tensor, axis=0)
+            input_tensor = np.ascontiguousarray(input_tensor, dtype=np.uint8)
             
+            output_tensor = self.engine.run([input_tensor])
             thres = conf_override if conf_override is not None else 0.40
-            raw_dets = self.postprocess(output_tensor, conf_thres=thres)
             
-            if not raw_dets: 
+            raw_data = output_tensor[0]
+            if isinstance(raw_data, bytes):
+                flat = np.frombuffer(raw_data, dtype=np.uint8)
+            else:
+                flat = np.array(raw_data, copy=False).view(np.uint8).flatten()
+            
+            if len(flat) == 0:
                 return np.empty((0,6))
-            
-            res = []
-            dw, dh = offset
-            
-            for box, score, cls_id in raw_dets:
-                x1 = np.clip((box[0] - dw) / scale, 0, w_orig)
-                y1 = np.clip((box[1] - dh) / scale, 0, h_orig)
-                x2 = np.clip((box[2] - dw) / scale, 0, w_orig)
-                y2 = np.clip((box[3] - dh) / scale, 0, h_orig)
                 
-                res.append([x1, y1, x2, y2, score, cls_id])
+            # Stride 크기에 따른 동적 파싱 (버전 호환성)
+            stride = 0
+            if len(flat) % 32 == 0:
+                stride = 32
+            elif len(flat) % 28 == 0:
+                stride = 28
                 
-            return np.array(res)
+            if stride > 0:
+                num_boxes = len(flat) // stride
+                flat_stride = flat.reshape(num_boxes, stride).copy()
+                
+                # Numpy View를 활용한 CPU 병목 제로 파싱
+                cxcywh = np.ascontiguousarray(flat_stride[:, :16]).view(np.float32).reshape(num_boxes, 4)
+                scores = np.ascontiguousarray(flat_stride[:, 20:24]).view(np.float32).flatten()
+                labels = np.ascontiguousarray(flat_stride[:, 24:28]).view(np.uint32).flatten()
+                
+                # Confidence 1차 필터링
+                mask = scores >= thres
+                if not np.any(mask):
+                    return np.empty((0,6))
+                    
+                cxcywh = cxcywh[mask]
+                scores = scores[mask]
+                labels = labels[mask]
+                
+                cx, cy = cxcywh[:, 0], cxcywh[:, 1]
+                w, h = cxcywh[:, 2], cxcywh[:, 3]
+                
+                x1 = cx - w * 0.5
+                y1 = cy - h * 0.5
+                
+                # [중요] 단일 통합 모델을 위한 Class-Aware NMS 오프셋 기법 결합
+                max_wh = 7680
+                class_offset = labels * max_wh
+                
+                # NMSBoxes는 [x, y, w, h] 포맷을 요구합니다
+                boxes_xywh = np.column_stack([x1 + class_offset, y1 + class_offset, w, h])
+                indices = cv2.dnn.NMSBoxes(boxes_xywh.tolist(), scores.tolist(), thres, 0.45)
+                
+                if len(indices) == 0:
+                    return np.empty((0,6))
+                    
+                keep = np.array(indices).flatten()
+                
+                # 오리지널 좌표 복원 (Offset 제외된 순수 x1, y1)
+                x1, y1 = x1[keep], y1[keep]
+                x2, y2 = cx[keep] + w[keep] * 0.5, cy[keep] + h[keep] * 0.5
+                scores, labels = scores[keep], labels[keep]
+                
+                # 원본 해상도 스케일링 복원
+                x1 = np.clip((x1 - dw) / scale, 0, w_orig)
+                y1 = np.clip((y1 - dh) / scale, 0, h_orig)
+                x2 = np.clip((x2 - dw) / scale, 0, w_orig)
+                y2 = np.clip((y2 - dh) / scale, 0, h_orig)
+                
+                return np.column_stack([x1, y1, x2, y2, scores, labels])
+                
+            else:
+                logger.error(f"⚠️ 지원하지 않는 NPU 버퍼 구조입니다: {len(flat)} bytes")
+                return np.empty((0,6))
+                
         except Exception as e:
             logger.error(f"NPU Inference Error: {e}")
             return np.empty((0,6))
@@ -968,7 +1010,7 @@ class CrossingDetector(BaseEventDetector):
         persons = [t for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]
         low_bodies = [t for t in tracks if track_map.get(int(t[4])) == ID_PERSON_LOW]
         
-        #하반신 매칭 및 발 위치 정밀 계산
+        # 하반신 매칭 및 발 위치 정밀 계산
         for p in persons:
             p_tid = int(p[4])
             curr_ids.add(p_tid)
@@ -979,7 +1021,8 @@ class CrossingDetector(BaseEventDetector):
             
             best_low_track = None
             max_ioa = 0
-            #해당 사람과 짝지어질 하반신을 찾습니다.
+            
+            # 해당 사람과 짝지어질 하반신 탐색
             for lb in low_bodies:
                 lx1, ly1, lx2, ly2 = lb[:4]
                 lcx, lcy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
@@ -994,8 +1037,6 @@ class CrossingDetector(BaseEventDetector):
                     
             curr_objects = [{'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid}]
             
-            #하반신이 정상적으로 찾아진 경우:
-            #사람 전체 박스 기준 발 위치(p_foot)와 진짜 발 위치(curr_pos)의 차이값을 lb_offsets에 저장해 둡니다. (나중에 하반신을 놓쳤을 때 쓰기 위함)
             if max_ioa >= 0.4 and best_low_track is not None:
                 lx1, ly1, lx2, ly2 = best_low_track[:4]
                 low_height = max(1, ly2 - ly1)
@@ -1007,8 +1048,6 @@ class CrossingDetector(BaseEventDetector):
                 
                 curr_objects.append({'label': 'low_body', 'box': [int(x) for x in best_low_track[:4]], 'score': float(best_low_track[5]), 'tid': int(best_low_track[4])})
             
-            #컨베이어 벨트에 가려지는 등 하반신을 찾지 못한 경우:
-            #과거에 저장해 두었던 오프셋(ox, oy)을 꺼내와, 대략적인 발 위치(p_foot)에 더해서 진짜 발 위치(curr_pos)를 역산해 냅니다.
             else:
                 if p_tid in self.lb_offsets:
                     ox, oy = self.lb_offsets[p_tid]
@@ -1017,7 +1056,8 @@ class CrossingDetector(BaseEventDetector):
                     event_bbox = (px1, py2 - low_height, px2, py2)
                 else: 
                     continue
-            #점프 방어
+                    
+            # 점프 방어 (너무 큰 순간 이동은 무시)
             if p_tid in self.prev:
                 jump_dist = get_distance(self.prev[p_tid], curr_pos)
                 if jump_dist > person_height * 0.2:
@@ -1025,8 +1065,7 @@ class CrossingDetector(BaseEventDetector):
                     self.prev[p_tid] = curr_pos
                     continue
                 
-            #횡단 판별: 아직 횡단 후보자가 아닌 경우, 과거 위치와 현재 위치를 이어 선분(trajectory)을 만듭니다.
-            #이 선분이 횡단선(p1, p2)과 교차(Intersect)했고, 그 진입 각도가 너무 평행하지 않다면(>= min_crossing_angle), 이 사람을 '선을 넘은 후보(candidates)'로 등록
+            # 횡단 판별: 궤적이 선분과 교차하는지 확인
             if p_tid in self.prev and p_tid not in self.candidates:
                 trajectory = (self.prev[p_tid], curr_pos)
                 for p1, p2 in self.lines:
@@ -1038,6 +1077,7 @@ class CrossingDetector(BaseEventDetector):
                                 'timestamp_time': current_time,
                                 'line': (p1, p2), 
                                 'entry_side': ccw(p1, p2, trajectory[0]), 
+                                'crossed_pos': curr_pos, # [추가] 선을 넘은 직후의 첫 발 위치 앵커 기록
                                 'bbox': event_bbox, 
                                 'frame': frame.copy() if frame is not None else None,
                                 'fid': fid,
@@ -1045,15 +1085,19 @@ class CrossingDetector(BaseEventDetector):
                             }
                         break
                     
-            #수직 거리 기반 최종 알람 트리거
+            # 수직 거리 및 교차 후 실이동 거리 기반 최종 알람 트리거
             if p_tid in self.candidates:
                 cand = self.candidates[p_tid]
                 p1, p2 = cand['line']
                 curr_side = ccw(p1, p2, curr_pos)
                 
-                #선 밖으로 진입했던 방향과 현재 방향이 반대라면
+                # 완전히 반대편으로 진입한 상태라면
                 if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
+                    # 1. 라인 기준 수직 침투 깊이
                     perp_dist = self._get_perpendicular_distance(p1, p2, curr_pos)
+                    # 2. [추가] 앵커(crossed_pos)로부터의 실제 추가 이동 거리
+                    post_cross_dist = get_distance(cand['crossed_pos'], curr_pos)
+                    
                     dx = abs(p2[0] - p1[0])
                     dy = abs(p2[1] - p1[1])
                     line_tilt_angle = math.degrees(math.atan2(dy, dx))
@@ -1061,7 +1105,8 @@ class CrossingDetector(BaseEventDetector):
                     tilt_factor = 1.0 + (math.sin(math.radians(line_tilt_angle)) * 0.5)
                     dynamic_threshold = cand['person_height'] * self.distance_ratio * tilt_factor
                     
-                    if perp_dist >= dynamic_threshold:
+                    # [핵심 보완] 수직 깊이를 충족하고, 동시에 1프레임 튐이 아니라 실제 발걸음이 발생했을 때만 트리거
+                    if perp_dist >= dynamic_threshold and post_cross_dist >= (dynamic_threshold * 0.6):
                         triggered.append({
                             'tid': p_tid, 
                             'bbox': cand['bbox'], 
@@ -1071,10 +1116,8 @@ class CrossingDetector(BaseEventDetector):
                         })
                         del self.candidates[p_tid]
                     else:
-                        # 알람은 안 울렸지만 현재 스코어가 어디까지 가고 있는지 상시 출력
                         if p_tid in self.candidates:
-                            print(f"[프레임 {fid}] ID {p_tid} 수직거리: {perp_dist:.2f} / 요구거리: {dynamic_threshold:.2f} (진행률: {(perp_dist/dynamic_threshold)*100:.1f}%)")
-                        
+                            print(f"[프레임 {fid}] ID {p_tid} 침투 깊이: {perp_dist:.2f} | 교차 후 실이동: {post_cross_dist:.2f} / 요구거리: {dynamic_threshold:.2f}")
                         
                 elif current_time - cand['timestamp_time'] > self.candidate_ttl_sec: 
                     del self.candidates[p_tid]
@@ -2974,12 +3017,13 @@ def main():
 
     try:
         logger.info("🔥 [최적화] DeepX 단일 통합 모델을 VPU에 할당 중...")
-        # [핵심] 여러 모델을 로드하지 않고, 모든 클래스가 있는 signalman.dxnn 하나만 로드합니다.
-        d_main = YoLoDeepX(os.path.join(PROJECT_ROOT, "signalman.dxnn"))
-        # 얼굴 모자이크용은 독립적으로 유지
-        d_face = YoLoDeepX(SYS_CFG["models"]["FACE"]) 
+        main_model_path = os.path.join(PROJECT_ROOT, SYS_CFG["models"]["MAIN"])
+        face_model_path = os.path.join(PROJECT_ROOT, SYS_CFG["models"]["FACE"])
+        
+        d_main = YoLoDeepX(main_model_path)
+        d_face = YoLoDeepX(face_model_path) 
     except Exception as e:
-        logger.error(f"모델 로드 실패. 경로를 확인하십시오: {e}")
+        logger.error(f"🚨 모델 로드 실패. PPU 컨버전이 완료된 dxnn 파일이 경로에 있는지 확인하십시오: {e}")
         return
 
     cams = []
@@ -3206,6 +3250,11 @@ def main():
         for c in cams: 
             c.reader.running = False
             c.recorder.running = False
+            
+        # [추가] 프로세스 종료 시 C++ 엔진 명시적 파괴 (메모리 누수 방어)
+        logger.info("🔄 [SYSTEM] NPU 메모리를 안전하게 해제합니다...")
+        if 'd_main' in locals(): d_main.release()
+        if 'd_face' in locals(): d_face.release()
             
         if is_gui_mode:
             cv2.destroyAllWindows()
