@@ -1,0 +1,5 @@
+{
+    "postprocess_id": 1,
+    "library_path": "/home/asus/novai/dx-runtime/dx_stream/dx_stream/custom_library/postprocess_library/YoloV5S_PPU/libpostprocess_yolov5s_ppu.so",
+    "function_name": "YOLOV5S_PPU"
+}

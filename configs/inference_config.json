@@ -1,0 +1,6 @@
+{
+    "preprocess_id": 1,
+    "inference_id": 1,
+    "model_path" : "/home/asus/novai/hanjin_cctv_v2.dxnn",
+    "use-ort": true
+}
