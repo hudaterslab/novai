@@ -2210,30 +2210,6 @@ class AnchorTrackingROIAligner:
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
-import ctypes
-
-# GStreamer 초기화
-Gst.init(None)
-
-# 컴파일된 C-API 브릿지 라이브러리 로드
-try:
-    dx_meta_lib = ctypes.CDLL(os.path.join(PROJECT_ROOT, "libdxmetaparser.so"))
-    
-    # 1. 객체 수 반환 함수 매핑
-    dx_meta_lib.get_num_objects.argtypes = [ctypes.c_void_p]
-    dx_meta_lib.get_num_objects.restype = ctypes.c_int
-
-    # 2. BBox 데이터 반환 함수 매핑
-    dx_meta_lib.get_object_data.argtypes = [
-        ctypes.c_void_p, ctypes.c_int,
-        ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int)
-    ]
-    dx_meta_lib.get_object_data.restype = None
-except Exception as e:
-    logger.error(f"🚨 메타데이터 파서 라이브러리 로드 실패: {e}")
-
 import subprocess
 
 class FrameReader:
@@ -2312,7 +2288,6 @@ class FrameReader:
             
     def read(self):
         with self.lock: 
-            # bboxes는 파이썬(cam.det_main.infer)에서 직접 추론하므로 빈 배열([])을 넘깁니다.
             return self.frame, self.fid, self.connected, []
 
 class Camera:
