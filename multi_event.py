@@ -1,21 +1,3 @@
-import traceback
-import threading
-import queue
-import logging
-import psutil
-import atexit
-from collections import deque, defaultdict
-import concurrent.futures
-import re
-import requests
-import pytz
-from urllib.parse import urlsplit, unquote
-from logging.handlers import TimedRotatingFileHandler, QueueHandler, QueueListener
-import argparse
-
-warnings = requests.packages.urllib3.exceptions.InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(warnings)
-
 # ==========================================
 # [1] 시스템 기본 설정 및 상수
 # ==========================================
@@ -39,13 +21,35 @@ os.environ["LIBVA_DRIVER_NAME"] = "iHD"
 os.environ["GST_VAAPI_ALL_DRIVERS"] = "1"
 
 os.environ["GST_PLUGIN_FEATURE_RANK"] = "vah264dec:MAX,vah265dec:MAX"
-
+import traceback
+import threading
+import queue
+import logging
+import psutil
+import atexit
+from collections import deque, defaultdict
+import concurrent.futures
+import re
+import requests
+import pytz
+from urllib.parse import urlsplit, unquote
+from logging.handlers import TimedRotatingFileHandler, QueueHandler, QueueListener
+import argparse
+warnings = requests.packages.urllib3.exceptions.InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(warnings)
 import gc
 import json
 import math
 import numpy as np
 import time
 import datetime
+import subprocess
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib
+# GStreamer 초기화
+Gst.init(None)
+import cv2
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_COMMON_FILE = os.path.join(PROJECT_ROOT, "system_config.json")
@@ -566,7 +570,6 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
 # ==========================================
 # [6] DeepX NPU 모델 추론 (공식 YOLOv8 PPU 디코더 완벽 롤백)
 # ==========================================
-import cv2
 class YoLoDeepX:
     def __init__(self, engine_path, pool_size=3):
         if not HAS_DX_ENGINE:
@@ -2207,11 +2210,6 @@ class AnchorTrackingROIAligner:
         self.last_debug["status"] = "anchor_direct_corrected_drift"
         return True
 
-import gi
-gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GLib
-import subprocess
-
 class FrameReader:
     def __init__(self, url, ip):
         self.url = sanitize_camera_url(url)
@@ -2223,6 +2221,8 @@ class FrameReader:
         self.lock = threading.Lock()
         
         self.pipeline = None
+        
+        # 외부 서브프로세스 없이 파이썬 단일 스레드로 우아하게 가동
         threading.Thread(target=self._run, daemon=True).start()
 
     def _on_new_sample(self, sink):
@@ -2237,6 +2237,7 @@ class FrameReader:
         success, map_info = buf.map(Gst.MapFlags.READ)
         if success:
             try:
+                # 메모리 누수 방지를 위한 안전한 버퍼 카피
                 frame_data = np.ndarray((height, width, 3), buffer=map_info.data, dtype=np.uint8)
                 with self.lock:
                     self.frame = frame_data.copy()
@@ -2247,13 +2248,12 @@ class FrameReader:
         return Gst.FlowReturn.OK
 
     def _run(self):
-        # [상용화 최종 아키텍처 - CPU 병목 66% 제거] 
-        # 무거운 CPU 연산(videoconvert)을 하기 전에, videorate로 초당 20프레임을 '날것의 상태'에서 미리 버립니다.
-        # drop-only=true 옵션을 주어 억지로 프레임을 복제하지 못하게 막습니다.
+        # [상용화 최종 아키텍처 - Native Resolution] 
+        # C++ 메타데이터 브릿지, videoscale, SHM 소켓 등 불안정 요소를 100% 제거했습니다.
         pipeline_str = (
             f"uridecodebin uri={self.url} source::protocols=tcp ! "
             f"queue max-size-bytes=0 max-size-buffers=3 max-size-time=0 ! "
-            f"videorate drop-only=true ! video/x-raw,framerate=15/1 ! "
+            f"videorate drop-only=true ! video/x-raw,framerate=10/1 ! "
             f"videoconvert ! video/x-raw,format=BGR ! "
             f"appsink name=mysink emit-signals=true drop=true max-buffers=1 sync=false"
         )
@@ -2274,7 +2274,7 @@ class FrameReader:
             appsink.connect("new-sample", self._on_new_sample)
             
             self.pipeline.set_state(Gst.State.PLAYING)
-            logger.info(f"✅ [CAM:{self.ip}] CPU 극한 최적화 파이프라인 가동 (원본 해상도 유지, 15 FPS).")
+            logger.info(f"✅ [CAM:{self.ip}] CPU 극한 최적화 파이프라인 가동 (원본 해상도 유지, 10 FPS).")
             
             while self.running:
                 time.sleep(0.1)
@@ -2285,9 +2285,10 @@ class FrameReader:
             if self.pipeline:
                 self.pipeline.set_state(Gst.State.NULL)
             self.connected = False
-            
+
     def read(self):
         with self.lock: 
+            # 외부 BBox 파서를 완전히 제거했으므로 빈 리스트([])를 넘겨 main()의 언패킹 규격을 맞춥니다.
             return self.frame, self.fid, self.connected, []
 
 class Camera:
